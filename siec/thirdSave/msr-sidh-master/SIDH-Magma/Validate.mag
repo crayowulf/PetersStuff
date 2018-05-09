@@ -1,0 +1,160 @@
+////////////////////////////////////////////////////////////////////////////////
+//                                                               
+// Efficient algorithms for supersingular isogeny Diffie-Hellman 
+// Craig Costello, Patrick Longa, Michael Naehrig, 2016         
+// (c) 2016 Microsoft Corporation. All rights reserved.         
+//                                                                                
+////////////////////////////////////////////////////////////////////////////////
+//                                                                               
+// This script gives the functions used to validate public keys. 
+// The functions are different for Alice and Bob
+//
+// Let a public key be [A,xP,xQ,xR] \in Fp2^4 (after A is recovered from the 
+// actual public key during decompression, see the paper)
+//
+// For Alice's validation of Bob's public keys, it asserts  that xP and xQ 
+// correspond to points P and Q of full order, lA^eA, and that the Weil pairing 
+// of P and Q has maximal order lA^(eA-1), which implies that P \neq [k]*Q for 
+// any integer k.
+// For Bob's validation of Alice's public keys, it asserts that xP and xQ 
+// correspond to points P and Q of full order, lB^eB, and that the Weil pairing
+// of P and Q has maximal order lB^eB, which implies that P \neq [k]*Q for any 
+// integer k.
+//
+// Both sides also use Sutherland's Monte Carlo algorithm to assert 
+// supersingularity. See the paper. 
+//
+
+test_curve:=function(A,X) 
+
+        /*
+        This function checks that the curve is in the correct supersingular
+        isogeny class via Sutherland's Monte Carlo algorithm. It also checks 
+        that the curve is not a subfield curve. Both Alice and Bob call this 
+        same function in their respective validation procedures below. 
+
+        Input:  
+        - The curve constant A, corresponding to E_a: y^2=x^3+A*x^2+x,
+        - a random value X in Fp2.
+        
+        Output: 
+        - A boolean, "true" if curve is valid, "false" otherwise.
+        */
+
+        // test j invariant in Fp2\Fp
+        t0:=A^2;
+        t0:=t0-3;
+        t1:=t0^2;
+        t1:=t1*t0; //  (A^2-3)^3
+        t0:=t0-1;
+        // t1 = c0+c1*i, t0=d0+d1*i
+        c0:=ElementToSequence(t1)[1]; //Fp 
+        c1:=ElementToSequence(t1)[2]; //Fp
+        d0:=ElementToSequence(t0)[1]; //Fp
+        d1:=ElementToSequence(t0)[2]; //Fp
+        c0:=c0*d1;
+        c1:=c1*d0;
+
+        valid_curve:=(c0 ne c1);
+        
+        // test supersingular
+        X,Z:=xDBLe(X,1,A,1,1);
+        X1,Z1:=xDBLe(X,Z,A,1,371);
+        X1,Z1:=xTPLe(X1,Z1,A,1,239);
+        X:=X*Z1;
+        Z:=Z*X1;
+        X:=X-Z;
+        X:=X*Z1;
+
+        valid_curve:=valid_curve and X eq 0;
+
+        return valid_curve;
+
+end function;
+
+////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+// Alice's validation of Bob's public keys   
+////////////////////////////////////////////////////////////////////////////////
+
+validate_PKB:=function(A,xP,xQ,xQP,e)
+
+        /*
+        This is the main function that validates Bob's public keys.
+
+        Input:  
+        - Bob's public key [A,xP,xQ,xQP],
+        - the exponent eA(=372 for our curve) for Miller's algorithm.
+
+        Output: 
+        - A boolean value, "true" if key is valid, "false" otherwise.
+        */
+
+    X:=Random(Fp2); // used for Sutherland's algorithm
+    // (can be fixed in practice, must be secret, make it a hash)
+
+    XP,ZP:=xDBLe(xP,1,A,1,e-2);
+    XQ,ZQ:=xDBLe(xQ,1,A,1,e-2);
+    t0:=XP*ZQ;
+    t1:=XQ*ZP;
+    t0:=t0-t1;
+    t0:=t0*ZP;
+    t0:=t0*ZQ;
+    valid:=t0 ne 0; //checks that ZP*ZQ*(XQ*ZP-XP*ZQ) \neq 0
+                    //i.e., that 2^(e-2)*P \neq 2^(e-2)*Q 
+                    // and neither P nor Q has order 2^(e-2)
+    t0:=A+2; //A24 input into xDBL
+    XP,ZP:=xDBL(XP,ZP,t0,4);
+    XQ,ZQ:=xDBL(XQ,ZQ,t0,4);
+    t0:=ZP*ZQ;
+    valid:=valid and (t0 ne 0); //checks that 2^(e-1)*P ne 0 and 2^(e-1)*Q ne 0
+    XP,ZP:=xDBL(XP,ZP,t0,4);
+    XQ,ZQ:=xDBL(XQ,ZQ,t0,4);
+    valid:=valid and (ZP eq 0); //checks that 2^e*P == 0 
+    valid:=valid and (ZQ eq 0); //checks that 2^e*Q == 0 
+    valid:=valid and test_curve(A,X); //tests curve via Sutherland's algorithm
+
+    return valid;
+
+end function;
+
+////////////////////////////////////////////////////////////////////////////////
+// Bob's validation of Alice's public keys   
+////////////////////////////////////////////////////////////////////////////////
+
+validate_PKA:=function(A,xP,xQ,xQP,e)
+
+    /*
+    This is the main function that validates Alice's public keys.
+
+    Input:  
+    - Alice's public key [A,xP,xQ,xQP],
+    - the exponent eB (=239 for our curve) for Miller's algorithm.
+
+    Output: 
+    - A boolean value, "true" if the key is valid, "false" otherwise.
+    */
+
+    X:=Random(Fp2); // used for Sutherland's algorithm
+    // (can be fixed in practice, must be secret, make it a hash)
+
+    XP,ZP:=xTPLe(xP,1,A,1,e-1);
+    XQ,ZQ:=xTPLe(xQ,1,A,1,e-1);
+    t0:=XP*ZQ;
+    t1:=XQ*ZP;
+    t0:=t0-t1;
+    t0:=t0*ZP;
+    t0:=t0*ZQ;
+    valid:=t0 ne 0; //checks that ZP*ZQ*(XQ*ZP-XP*ZQ) \neq 0
+                    //i.e., that 3^(e-1)*P \neq 3^(e-1)*Q 
+                    //and neither P nor Q has order 3^(e-1)
+    XP,ZP:=xTPLe(XP,ZP,A,1,1);
+    XQ,ZQ:=xTPLe(XQ,ZQ,A,1,1);
+    valid:=valid and (ZP eq 0); //checks that 3^e*P == 0 
+    valid:=valid and (ZQ eq 0); //checks that 3^e*Q == 0 
+    valid:=valid and test_curve(A,X); //tests curve via Sutherland's algorithm
+
+    return valid;
+
+end function;
+

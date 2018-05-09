@@ -1,0 +1,855 @@
+/********************************************************************************************
+* SIDH: an efficient supersingular isogeny-based cryptography library for ephemeral 
+*       Diffie-Hellman key exchange.
+*
+*    Copyright (c) Microsoft Corporation. All rights reserved.
+*
+*
+* Abstract: benchmarking/testing isogeny-based key exchange
+*
+*********************************************************************************************/ 
+
+#include "../SIDH.h"
+#include "test_extras.h"
+#include <malloc.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <string.h>
+#define PORT 8080
+
+// Benchmark and test parameters  
+#if defined(GENERIC_IMPLEMENTATION) 
+    #define BENCH_LOOPS        5      // Number of iterations per bench 
+    #define TEST_LOOPS         5      // Number of iterations per test
+#else
+    #define BENCH_LOOPS       10       
+    #define TEST_LOOPS        10      
+#endif
+#define BIGMONT_TEST_LOOPS    10      // Number of iterations per BigMont test
+
+// Used in BigMont tests
+static const uint64_t output1[12] = { 0x30E9AFA5BF75A92F, 0x88BC71EE9E221028, 0x999A50A9EE3B9A8E, 0x77E2934BD8D38B5A, 0x2668CAFC2933DB58, 0x457C65F7AD941041, 
+                                      0x72EA3D5F92F33153, 0x6E04B56AF98D6285, 0x28FA680C091A9AE2, 0xE73DFE058AFD79ED, 0x902CD9E695BC7260, 0x00006FAC6F6E88AF };
+static const uint64_t scalar1[12] = { 0x154A166BBD471DF4, 0xBF7CA3B41010FE6B, 0xC34BD28655936246, 0xAD8E8F394D3428B5, 0x275B1116E6B3BF08, 0x3C024A3CC03A6AFC,
+                                      0x2300A0049FC615AF, 0xA0060FEC19263F0B, 0x69A1EB9091B8162C, 0xFDBE1DF28CDC03EE, 0xAA2030E6922EF3D5, 0x0000075E7401FA0E };
+   int server_fd, new_socket, valread;
+unsigned char *SharedSecretA;
+
+typedef unsigned int WORD; // should be 32-bit = 4 bytes
+#define w 32                    // word size in bits
+#define r 12                    // number of rounds
+#define b 192                    // number of bytes in key
+#define c 48                     // number of words in key, c = max(1,ceil(8*b/w))
+#define t 26                    // size of table S = 2*(r+1) words
+WORD S[t];                      // expended key table
+WORD P = 0xb7e15163, Q = 0x9e3779b9; // magic constatns
+
+// Rotation operators, x must be unsigned, to get logical right shift
+#define ROTL(x,y) (((x)<<(y&(w-1))) | ((x)>>(w-(y&(w-1)))))
+#define ROTR(x,y) (((x)>>(y&(w-1))) | ((x)<<(w-(y&(w-1)))))
+void RC5_SETUP(unsigned char *K)
+{
+   // w = 32, r = 12, b = 16
+   // c = max(1, ceil(8 * b/w))
+   // t = 2 * (r+1)
+   WORD i, j, k, u = w/8, A, B, L[c];
+   
+   for(i = b-1, L[c-1] = 0; i != -1; i--)
+      L[i/u] = (L[i/u] << 8) + K[i];
+   
+   for(S[0] = P, i = 1; i < t; i++)
+      S[i] = S[i-1] + Q;
+   
+   for(A = B = i = j = k = 0; k < 3 * t; k++, i = (i+1) % t, j = (j+1) % c) {
+      A = S[i] = ROTL(S[i] + (A + B), 3);
+      B = L[j] = ROTL(L[j] + (A + B), (A + B));
+   }
+}
+
+void RC5_ENCRYPT(WORD *pt, WORD *ct) {
+   WORD i, A = pt[0] + S[0], B = pt[1] + S[1];
+   
+   for(i = 1; i <= r; i++) {
+      A = ROTL(A ^ B, B) + S[2*i];
+      B = ROTL(B ^ A, A) + S[2*i + 1];
+   }
+   ct[0] = A; ct[1] = B;
+}
+
+void RC5_DECRYPT(WORD *ct, WORD *pt) {
+   WORD i, B=ct[1], A=ct[0];
+   
+   for(i = r; i > 0; i--) {
+      B = ROTR(B - S[2*i + 1], A) ^ A;
+      A = ROTR(A - S[2*i], B) ^ B;
+   }
+   
+   pt[1] = B - S[1]; pt[0] = A - S[0];
+}
+
+void printword(WORD A) {
+   WORD k;
+   for (k = 0; k < w; k+=8)
+      printf("%x", (A >> k) & 0xFF);
+}
+
+CRYPTO_STATUS cryptotest_kex(PCurveIsogenyStaticData CurveIsogenyData)
+{ // Testing key exchange
+    unsigned int i, pbytes = (CurveIsogenyData->pwordbits + 7)/8;   // Number of bytes in a field element 
+    unsigned int obytes = (CurveIsogenyData->owordbits + 7)/8;      // Number of bytes in an element in [1, order]
+    unsigned char *PrivateKeyA, *PrivateKeyB, *PublicKeyA, *PublicKeyB, *SharedSecretB;
+    PCurveIsogenyStruct CurveIsogeny = {0};
+    CRYPTO_STATUS Status = CRYPTO_SUCCESS;
+    bool passed = true;
+        
+    // Allocating memory for private keys, public keys and shared secrets
+    PrivateKeyA = (unsigned char*)calloc(1, obytes);        // One element in [1, order]  
+    PrivateKeyB = (unsigned char*)calloc(1, obytes);
+    PublicKeyA = (unsigned char*)calloc(1, 3*2*pbytes);     // Three elements in GF(p^2)
+    PublicKeyB = (unsigned char*)calloc(1, 3*2*pbytes);
+    SharedSecretA = (unsigned char*)calloc(1, 2*pbytes);    // One element in GF(p^2)  
+    SharedSecretB = (unsigned char*)calloc(1, 2*pbytes);
+
+    printf("obytes: %d\n", obytes);
+    printf("sizeof(obytes): %d\n", sizeof(obytes));
+    printf("pbytes: %d\n", pbytes);
+    printf("sizeof(pbytes): %d\n", sizeof(pbytes));
+    
+    printf("\n\nTESTING EPHEMERAL ISOGENY-BASED KEY EXCHANGE \n");
+    printf("--------------------------------------------------------------------------------------------------------\n\n");
+    printf("Curve isogeny system: %s \n\n", CurveIsogenyData->CurveIsogeny);
+
+    // Curve isogeny system initialization
+    CurveIsogeny = SIDH_curve_allocate(CurveIsogenyData);
+    if (CurveIsogeny == NULL) {
+        Status = CRYPTO_ERROR_NO_MEMORY;
+        goto cleanup;
+    }
+    Status = SIDH_curve_initialize(CurveIsogeny, &random_bytes_test, CurveIsogenyData);
+    if (Status != CRYPTO_SUCCESS) {
+        goto cleanup;
+    }
+
+    //for (i = 0; i < TEST_LOOPS; i++) 
+   // {
+        Status = EphemeralKeyGeneration_A(PrivateKeyA, PublicKeyA, CurveIsogeny);                            // Get some value as Alice's secret key and compute Alice's public key
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            goto cleanup;
+        } 
+        send(new_socket , PublicKeyA, 3*2*pbytes, 0);
+        valread = read( new_socket , PublicKeyB, 3*2*pbytes);
+        
+        //Status = EphemeralKeyGeneration_B(PrivateKeyB, PublicKeyB, CurveIsogeny);                            // Get some value as Bob's secret key and compute Bob's public key
+        //if (Status != CRYPTO_SUCCESS) {                                                  
+        //    goto cleanup;
+        //}
+    
+        Status = EphemeralSecretAgreement_A(PrivateKeyA, PublicKeyB, SharedSecretA, CurveIsogeny);           // Alice computes her shared secret using Bob's public key
+        if (Status != CRYPTO_SUCCESS) {
+            goto cleanup;
+        }    
+        //Status = EphemeralSecretAgreement_B(PrivateKeyB, PublicKeyA, SharedSecretB, CurveIsogeny);           // Bob computes his shared secret using Alice's public key
+        //if (Status != CRYPTO_SUCCESS) {
+        //    goto cleanup;
+        //}
+
+        printf("Alice Shared Secret: ");
+        for (i = 0; i < 2*pbytes; i++){
+           printf("%x", SharedSecretA[i]);
+        } printf("\n");
+ 
+        //if (compare_words((digit_t*)SharedSecretA, (digit_t*)SharedSecretB, NBYTES_TO_NWORDS(2*pbytes)) != 0) {
+        //    passed = false;
+        //    Status = CRYPTO_ERROR_SHARED_KEY;
+        //    //break;
+        //}
+    //}
+
+    if (passed == true) printf("  Key exchange tests ........................................... PASSED");
+    else { printf("  Key exchange tests ... FAILED"); printf("\n"); goto cleanup; }
+    printf("\n"); 
+
+cleanup:
+    SIDH_curve_free(CurveIsogeny);    
+    free(PrivateKeyA);    
+    free(PrivateKeyB);    
+    free(PublicKeyA);    
+    free(PublicKeyB);    
+    free(SharedSecretA);    
+    free(SharedSecretB);
+
+    return Status;
+}
+
+
+CRYPTO_STATUS cryptotest_kex_compress(PCurveIsogenyStaticData CurveIsogenyData)
+{ // Compression tests
+	unsigned int i;
+	unsigned int pbytes = (CurveIsogenyData->pwordbits + 7)/8;    // Number of bytes in a field element 
+	unsigned int obytes = (CurveIsogenyData->owordbits + 7)/8;    // Number of bytes in an element in [1, order]
+	unsigned char *PrivateKeyA, *PublicKeyA, *PrivateKeyB, *PublicKeyB, *CompressedPKA, *CompressedPKB, *PublicKeyA_tmp, *PublicKeyB_tmp, *SharedSecretA, *SharedSecretB, *R, *A;
+	PCurveIsogenyStruct CurveIsogeny = {0};
+	CRYPTO_STATUS Status = CRYPTO_SUCCESS;
+	bool passed = true;
+
+	// Allocating memory for private keys, public keys and shared secrets
+	PrivateKeyA = (unsigned char*)calloc(1, obytes);                   // One element in [1, order]  
+	PrivateKeyB = (unsigned char*)calloc(1, obytes);
+	PublicKeyA = (unsigned char*)calloc(1, 3*2*pbytes);                // Three elements in GF(p^2)
+	PublicKeyB = (unsigned char*)calloc(1, 3*2*pbytes);
+	PublicKeyA_tmp = (unsigned char*)calloc(1, 3*2*pbytes);            // Three elements in GF(p^2)
+	PublicKeyB_tmp = (unsigned char*)calloc(1, 3*2*pbytes);
+	CompressedPKA = (unsigned char*)calloc(1, 3*obytes + 2*pbytes);    // Three elements in [1, order] plus one field element
+	CompressedPKB = (unsigned char*)calloc(1, 3*obytes + 2*pbytes);
+    SharedSecretA = (unsigned char*)calloc(1, 2*pbytes);               // One element in GF(p^2)  
+    SharedSecretB = (unsigned char*)calloc(1, 2*pbytes);
+    R = (unsigned char*)calloc(1, 2*2*pbytes);                         // One point in (X:Z) coordinates 
+    A = (unsigned char*)calloc(1, 2*pbytes);                           // One element in GF(p^2)  
+
+    printf("\n\nTESTING EPHEMERAL ISOGENY-BASED KEY EXCHANGE USING COMPRESSION \n");
+    printf("--------------------------------------------------------------------------------------------------------\n\n");
+    printf("Curve isogeny system: %s \n\n", CurveIsogenyData->CurveIsogeny);
+
+	// Curve isogeny system initialization
+	CurveIsogeny = SIDH_curve_allocate(CurveIsogenyData);
+	if (CurveIsogeny == NULL) {
+		Status = CRYPTO_ERROR_NO_MEMORY;
+		goto cleanup;
+	}
+	Status = SIDH_curve_initialize(CurveIsogeny, &random_bytes_test, CurveIsogenyData);
+	if (Status != CRYPTO_SUCCESS) {
+		goto cleanup;
+	}
+
+    for (i = 0; i < TEST_LOOPS; i++) 
+    {
+        Status = EphemeralKeyGeneration_A(PrivateKeyA, PublicKeyA, CurveIsogeny);                            // Get some value as Alice's secret key and compute Alice's public key
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            goto cleanup;
+        } 
+        PublicKeyCompression_A(PublicKeyA, CompressedPKA, CurveIsogeny);                                     // Alice compresses her public key
+
+        Status = EphemeralKeyGeneration_B(PrivateKeyB, PublicKeyB, CurveIsogeny);                            // Get some value as Bob's secret key and compute Bob's public key
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            goto cleanup;
+        }
+        PublicKeyCompression_B(PublicKeyB, CompressedPKB, CurveIsogeny);                                     // Bob compresses his public key
+
+        PublicKeyBDecompression_A(PrivateKeyA, CompressedPKB, R, A, CurveIsogeny);                           // Alice decompresses Bob's public key data using her private key
+        Status = EphemeralSecretAgreement_Compression_A(PrivateKeyA, R, A, SharedSecretA, CurveIsogeny);     // Alice computes her shared secret using decompressed Bob's public key data
+        if (Status != CRYPTO_SUCCESS) {
+            goto cleanup;
+        }  
+
+        PublicKeyADecompression_B(PrivateKeyB, CompressedPKA, R, A, CurveIsogeny);                           // Bob decompresses Alice's public key data using his private key  
+        Status = EphemeralSecretAgreement_Compression_B(PrivateKeyB, R, A, SharedSecretB, CurveIsogeny);     // Bob computes his shared secret using the decompressed Alice's public key data
+        if (Status != CRYPTO_SUCCESS) {
+            goto cleanup;
+        }  
+
+        if (compare_words((digit_t*)SharedSecretA, (digit_t*)SharedSecretB, NBYTES_TO_NWORDS(2*pbytes)) != 0) {
+            passed = false;
+            Status = CRYPTO_ERROR_SHARED_KEY;
+            break;
+        }
+	}
+	if (passed == true) printf("  Key exchange tests using compression.......................... PASSED");
+	else { printf("  Key exchange tests using compression... FAILED"); printf("\n"); goto cleanup; }
+	printf("\n"); 
+
+cleanup:
+    SIDH_curve_free(CurveIsogeny);   
+    free(PrivateKeyA);    
+    free(PrivateKeyB);    
+    free(PublicKeyA);    
+    free(PublicKeyB);    
+    free(PublicKeyA_tmp);    
+    free(PublicKeyB_tmp);         
+    free(CompressedPKA);    
+    free(CompressedPKB); 
+    free(SharedSecretA);    
+    free(SharedSecretB);  
+    free(R);    
+    free(A); 
+
+    return Status;
+}
+
+
+CRYPTO_STATUS cryptotest_BigMont(PCurveIsogenyStaticData CurveIsogenyData)
+{ // Testing BigMont
+    unsigned int i, j; 
+    digit_t scalar[BIGMONT_NWORDS_ORDER] = {0};
+    felm_t x = {0};
+    PCurveIsogenyStruct CurveIsogeny = {0};
+    CRYPTO_STATUS Status = CRYPTO_SUCCESS;
+    bool passed = true;
+
+    printf("\n\nTESTING ELLIPTIC CURVE BIGMONT \n");
+    printf("--------------------------------------------------------------------------------------------------------\n\n");
+
+    // Curve isogeny system initialization
+    CurveIsogeny = SIDH_curve_allocate(CurveIsogenyData);
+    if (CurveIsogeny == NULL) {
+        Status = CRYPTO_ERROR_NO_MEMORY;
+        goto cleanup;
+    }
+    Status = SIDH_curve_initialize(CurveIsogeny, &random_bytes_test, CurveIsogenyData);
+    if (Status != CRYPTO_SUCCESS) {
+        goto cleanup;
+    }
+    
+    copy_words((digit_t*)scalar1, scalar, BIGMONT_NWORDS_ORDER);    // Set scalar
+    x[0] = 3;                                                       // Set initial x-coordinate
+
+    for (i = 0; i < BIGMONT_TEST_LOOPS; i++)
+    {
+        for (j = 0; j < BIGMONT_NWORDS_ORDER-1; j++) {
+            scalar[j] = (scalar[j] >> 1) | (scalar[j+1] << (RADIX-1));  
+        }
+        scalar[BIGMONT_NWORDS_ORDER-1] >>= 1;
+
+        Status = BigMont_ladder((unsigned char*)x, scalar, (unsigned char*)x, CurveIsogeny);   
+        if (Status != CRYPTO_SUCCESS) {
+            goto cleanup;
+        }
+    }
+
+    if (compare_words((digit_t*)x, (digit_t*)output1, BIGMONT_NWORDS_ORDER) != 0) {
+        passed = false;
+        Status = CRYPTO_ERROR_SHARED_KEY;
+    }
+
+    if (passed == true) printf("  BigMont's scalar multiplication tests ........................ PASSED");
+    else { printf("  BigMont's scalar multiplication tests ... FAILED"); printf("\n"); goto cleanup; }
+    printf("\n"); 
+
+cleanup:
+    SIDH_curve_free(CurveIsogeny);
+
+    return Status;
+}
+
+
+CRYPTO_STATUS cryptorun_kex(PCurveIsogenyStaticData CurveIsogenyData)
+{ // Benchmarking key exchange
+    unsigned int pbytes = (CurveIsogenyData->pwordbits + 7)/8;      // Number of bytes in a field element 
+    unsigned int n, obytes = (CurveIsogenyData->owordbits + 7)/8;   // Number of bytes in an element in [1, order]
+    unsigned char *PrivateKeyA, *PrivateKeyB, *PublicKeyA, *PublicKeyB, *SharedSecretA, *SharedSecretB;
+    PCurveIsogenyStruct CurveIsogeny = {0};
+    unsigned long long cycles, cycles1, cycles2;
+    CRYPTO_STATUS Status = CRYPTO_SUCCESS;
+    bool passed;
+        
+    // Allocating memory for private keys, public keys and shared secrets
+    PrivateKeyA = (unsigned char*)calloc(1, obytes);        // One element in [1, order]  
+    PrivateKeyB = (unsigned char*)calloc(1, obytes);
+    PublicKeyA = (unsigned char*)calloc(1, 3*2*pbytes);     // Three elements in GF(p^2)
+    PublicKeyB = (unsigned char*)calloc(1, 3*2*pbytes);
+    SharedSecretA = (unsigned char*)calloc(1, 2*pbytes);    // One element in GF(p^2)  
+    SharedSecretB = (unsigned char*)calloc(1, 2*pbytes);
+
+    printf("\n\nBENCHMARKING EPHEMERAL ISOGENY-BASED KEY EXCHANGE \n");
+    printf("--------------------------------------------------------------------------------------------------------\n\n");
+    printf("Curve isogeny system: %s \n\n", CurveIsogenyData->CurveIsogeny);
+
+    // Curve isogeny system initialization
+    CurveIsogeny = SIDH_curve_allocate(CurveIsogenyData);
+    if (CurveIsogeny == NULL) {
+        Status = CRYPTO_ERROR_NO_MEMORY;
+        goto cleanup;
+    }
+    Status = SIDH_curve_initialize(CurveIsogeny, &random_bytes_test, CurveIsogenyData);
+    if (Status != CRYPTO_SUCCESS) {
+        goto cleanup;
+    }
+
+    // Benchmarking Alice's key generation
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        Status = EphemeralKeyGeneration_A(PrivateKeyA, PublicKeyA, CurveIsogeny);                     
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            passed = false;
+            break;
+        }    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Alice's key generation runs in ............................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Alice's key generation failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Bob's key generation
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        Status = EphemeralKeyGeneration_B(PrivateKeyB, PublicKeyB, CurveIsogeny);                     
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            passed = false;
+            break;
+        }    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Bob's key generation runs in ................................. %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Bob's key generation failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Alice's shared key computation
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        Status = EphemeralSecretAgreement_A(PrivateKeyA, PublicKeyB, SharedSecretA, CurveIsogeny);                     
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            passed = false;
+            break;
+        }    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Alice's shared key computation runs in ....................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Alice's shared key computation failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Bob's shared key computation
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        Status = EphemeralSecretAgreement_B(PrivateKeyB, PublicKeyA, SharedSecretB, CurveIsogeny);                     
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            passed = false;
+            break;
+        }    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Bob's shared key computation runs in ......................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Bob's shared key computation failed"); goto cleanup; } 
+    printf("\n");
+
+cleanup:
+    SIDH_curve_free(CurveIsogeny);    
+    free(PrivateKeyA);    
+    free(PrivateKeyB);    
+    free(PublicKeyA);    
+    free(PublicKeyB);    
+    free(SharedSecretA);    
+    free(SharedSecretB);
+
+    return Status;
+}
+
+
+CRYPTO_STATUS cryptorun_kex_compress(PCurveIsogenyStaticData CurveIsogenyData)
+{ // Benchmarking key exchange with compression
+    unsigned int pbytes = (CurveIsogenyData->pwordbits + 7)/8;      // Number of bytes in a field element 
+    unsigned int n, obytes = (CurveIsogenyData->owordbits + 7)/8;   // Number of bytes in an element in [1, order]
+    unsigned char *PrivateKeyA, *PrivateKeyB, *PublicKeyA, *PublicKeyB, *CompressedPKA, *CompressedPKB, *SharedSecretA, *SharedSecretB, *R, *A;
+    PCurveIsogenyStruct CurveIsogeny = {0};
+    unsigned long long cycles, cycles1, cycles2;
+    CRYPTO_STATUS Status = CRYPTO_SUCCESS;
+    bool passed;
+        
+    // Allocating memory for private keys, public keys and shared secrets
+    PrivateKeyA = (unsigned char*)calloc(1, obytes);                   // One element in [1, order]  
+    PrivateKeyB = (unsigned char*)calloc(1, obytes);
+    PublicKeyA = (unsigned char*)calloc(1, 3*2*pbytes);                // Three elements in GF(p^2)
+    PublicKeyB = (unsigned char*)calloc(1, 3*2*pbytes);
+    CompressedPKA = (unsigned char*)calloc(1, 3*obytes + 2*pbytes);    // Three elements in [1, order] and one field element  
+    CompressedPKB = (unsigned char*)calloc(1, 3*obytes + 2*pbytes); 
+    SharedSecretA = (unsigned char*)calloc(1, 2*pbytes);               // One element in GF(p^2)
+    SharedSecretB = (unsigned char*)calloc(1, 2*pbytes); 
+    R = (unsigned char*)calloc(1, 2*2*pbytes);                         // One point in (X:Z) coordinates 
+    A = (unsigned char*)calloc(1, 2*pbytes);                           // One element in GF(p^2)             
+
+    printf("\n\nBENCHMARKING EPHEMERAL ISOGENY-BASED KEY EXCHANGE USING COMPRESSION \n");
+    printf("--------------------------------------------------------------------------------------------------------\n\n");
+    printf("Curve isogeny system: %s \n\n", CurveIsogenyData->CurveIsogeny);
+
+    // Curve isogeny system initialization
+    CurveIsogeny = SIDH_curve_allocate(CurveIsogenyData);
+    if (CurveIsogeny == NULL) {
+        Status = CRYPTO_ERROR_NO_MEMORY;
+        goto cleanup;
+    }
+    Status = SIDH_curve_initialize(CurveIsogeny, &random_bytes_test, CurveIsogenyData);
+    if (Status != CRYPTO_SUCCESS) {
+        goto cleanup;
+    } 
+
+    Status = EphemeralKeyGeneration_A(PrivateKeyA, PublicKeyA, CurveIsogeny);    // Get some value as Alice's secret key and compute Alice's public key
+    if (Status != CRYPTO_SUCCESS) {                                                  
+        goto cleanup;
+    }
+
+    Status = EphemeralKeyGeneration_B(PrivateKeyB, PublicKeyB, CurveIsogeny);    // Get some value as Bob's secret key and compute Bob's public key
+    if (Status != CRYPTO_SUCCESS) {                                                  
+        goto cleanup;
+    }
+
+    // Benchmarking Alice's public key compression
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles(); 
+        PublicKeyCompression_A(PublicKeyA, CompressedPKA, CurveIsogeny);                   
+        //if (Status != CRYPTO_SUCCESS) {                                                  
+        //    passed = false;
+        //    break;
+        //}    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Alice's public key compression runs in ....................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Alice's public key compression failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Alice's key decompression
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        PublicKeyADecompression_B(PrivateKeyB, CompressedPKA, R, A, CurveIsogeny);    // Bob decompresses Alice's public key data using his private key  
+        if (Status != CRYPTO_SUCCESS) {
+            goto cleanup;
+        }                 
+        //if (Status != CRYPTO_SUCCESS) {                                                  
+        //    passed = false;
+        //    break;
+        //}    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Alice's public key decompression by Bob runs in .............. %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Alice's public key decompression by Bob failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Bob's shared key computation
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        Status = EphemeralSecretAgreement_Compression_B(PrivateKeyB, R, A, SharedSecretB, CurveIsogeny);    // Bob computes his shared secret using the decompressed Alice's public key data
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            passed = false;
+            break;
+        }    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Bob's shared key computation runs in ......................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Bob's shared key computation failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Bob's public key compression
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        PublicKeyCompression_B(PublicKeyB, CompressedPKB, CurveIsogeny);                    
+        //if (Status != CRYPTO_SUCCESS) {                                                  
+        //    passed = false;
+        //    break;
+        //}    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Bob's public key compression runs in ......................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Bob's public key compression failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Bob's key decompression
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        PublicKeyBDecompression_A(PrivateKeyA, CompressedPKB, R, A, CurveIsogeny);    // Alice decompresses Bob's public key data using her private key                     
+        //if (Status != CRYPTO_SUCCESS) {                                                  
+        //    passed = false;
+        //    break;
+        //}    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Bob's public key decompression by Alice runs in .............. %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Bob's public key decompression by Alice failed"); goto cleanup; } 
+    printf("\n");
+
+    // Benchmarking Alice's shared key computation
+    passed = true;
+    cycles = 0;
+    for (n = 0; n < BENCH_LOOPS; n++)
+    {
+        cycles1 = cpucycles();
+        Status = EphemeralSecretAgreement_Compression_A(PrivateKeyA, R, A, SharedSecretA, CurveIsogeny);    // Alice computes her shared secret using the decompressed Bob's public key data
+        if (Status != CRYPTO_SUCCESS) {                                                  
+            passed = false;
+            break;
+        }    
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  Alice's shared key computation runs in ....................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  Alice's shared key computation failed"); goto cleanup; } 
+    printf("\n");
+
+cleanup:
+    SIDH_curve_free(CurveIsogeny);   
+    free(PrivateKeyA);    
+    free(PrivateKeyB);    
+    free(PublicKeyA);    
+    free(PublicKeyB);         
+    free(CompressedPKA);    
+    free(CompressedPKB); 
+    free(SharedSecretA);    
+    free(SharedSecretB);  
+    free(R);    
+    free(A); 
+
+    return Status;
+}
+
+
+CRYPTO_STATUS cryptorun_BigMont(PCurveIsogenyStaticData CurveIsogenyData)
+{ // Benchmarking BigMont
+    unsigned int i; 
+    digit_t scalar[BIGMONT_NWORDS_ORDER] = {0};
+    f2elm_t x = {0};
+    PCurveIsogenyStruct CurveIsogeny = {0};
+    unsigned long long cycles, cycles1, cycles2;
+    CRYPTO_STATUS Status = CRYPTO_SUCCESS;
+    bool passed;
+
+    printf("\n\nBENCHMARKING ELLIPTIC CURVE BIGMONT \n");
+    printf("--------------------------------------------------------------------------------------------------------\n\n");
+
+    // Curve isogeny system initialization
+    CurveIsogeny = SIDH_curve_allocate(CurveIsogenyData);
+    if (CurveIsogeny == NULL) {
+        Status = CRYPTO_ERROR_NO_MEMORY;
+        goto cleanup;
+    }
+    Status = SIDH_curve_initialize(CurveIsogeny, &random_bytes_test, CurveIsogenyData);
+    if (Status != CRYPTO_SUCCESS) {
+        goto cleanup;
+    }
+    
+    x[0][0] = 3;                                                    // Set initial x-coordinate
+    
+    passed = true;
+    cycles = 0;
+    for (i = 0; i < BENCH_LOOPS; i++)
+    {        
+        // Choose a random number in [1, BigMont_order-1] as scalar
+        Status = random_BigMont_mod_order(scalar, CurveIsogeny);    
+        if (Status != CRYPTO_SUCCESS) {
+            goto cleanup;
+        }
+
+        cycles1 = cpucycles();
+        Status = BigMont_ladder((unsigned char*)x, scalar, (unsigned char*)x, CurveIsogeny);   
+        if (Status != CRYPTO_SUCCESS) {
+            goto cleanup;
+        }   
+        cycles2 = cpucycles();
+        cycles = cycles+(cycles2-cycles1);
+    }
+    if (passed) { printf("  BigMont's scalar multiplication runs in ...................... %10lld ", cycles/BENCH_LOOPS); print_unit; }
+    else { printf("  BigMont's scalar multiplication failed"); goto cleanup; } 
+    printf("\n");
+
+cleanup:
+    SIDH_curve_free(CurveIsogeny);
+
+    return Status;
+}
+
+
+int main()
+{
+  CRYPTO_STATUS Status = CRYPTO_SUCCESS;
+    
+
+   // start client ////////////////////////////////////////////////////////////
+   int a = 0;
+    a = a + 1; 
+    printf("here");
+
+
+   struct sockaddr_in address;
+   int opt = 1;
+   int addrlen = sizeof(address);
+   char buffer[1024] = {0};
+   char *hello = "ls";
+
+   // Creating socket file descriptor
+   if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0)
+     {
+       perror("socket failed");
+       exit(EXIT_FAILURE);
+     }
+
+   // Forcefully attaching socket to the port 8080
+   //   if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
+   //                  &opt, sizeof(opt)))
+   //   {
+   //      perror("setsockopt");
+   //      exit(EXIT_FAILURE);
+   //   }
+   setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+   address.sin_family = AF_INET;
+   address.sin_addr.s_addr = INADDR_ANY;
+   address.sin_port = htons( PORT );
+
+   // Forcefully attaching socket to the port 8080
+   if (bind(server_fd, (struct sockaddr *)&address,
+	    sizeof(address))<0)
+     {
+       perror("bind failed");
+       exit(EXIT_FAILURE);
+     }
+   if (listen(server_fd, 3) < 0)
+     {
+       perror("listen");
+       exit(EXIT_FAILURE);
+     }
+   if ((new_socket = accept(server_fd, (struct sockaddr *)&address,
+			    (socklen_t*)&addrlen))<0)
+     {
+       perror("accept");
+       exit(EXIT_FAILURE);
+     }
+   valread = read( new_socket , buffer, 1024);
+   printf("valread: %d\n", valread);
+   printf("%s\n",buffer );
+   send(new_socket , hello , strlen(hello) , 0 );
+   printf("Hello message sent\n");
+
+   unsigned char key[b];
+   char outputWords[1024];
+
+    Status = cryptotest_kex(&CurveIsogeny_SIDHp751);             // Test key exchange system "SIDHp751"
+    if (Status != CRYPTO_SUCCESS) {
+        printf("\n\n   Error detected: %s \n\n", SIDH_get_error_message(Status));
+        return false;
+    }
+
+   for (int i = 0; i < b; i++){
+      key[i] = SharedSecretA[i];
+   }
+   RC5_SETUP(key);
+   //   valread = read( new_socket , buffer, 1024); //idk
+   valread = read( new_socket , outputWords, 256); //idk
+   printf("Deciphered hex: ");
+   for (int i = 0; i < 128; i++){
+     //printword(outputWords[i*2]); printword(outputWords[i*2+1]);
+     RC5_DECRYPT((WORD*)outputWords + i*8, (WORD*)buffer + i*8);
+	            printf("%c", buffer[i*8]); printf("%c", buffer[i*8+1]); printf("%c", buffer[i*8+2]);
+	            printf("%c", buffer[i*8+3]); printf("%c", buffer[i*8+4]); printf("%c", buffer[i*8+5]);
+	            printf("%c", buffer[i*8+6]); printf("%c", buffer[i*8+7]);
+   }printf("\n");
+    
+   printf("%s\n",buffer ); // end client ///////////////////////////////////////////
+
+
+
+
+       // printf("Alice Shared Secret: ");
+       // for (int i = 0; i < b; i++){
+       //    printf("%x", SharedSecretA[i]);
+       // } printf("\n");
+
+   WORD i, j, k, pt1[2], pt2[2], ct[2] = {0, 0};
+
+
+   if (sizeof(WORD) !=4)
+      printf("RC5 error: WORD has %d byes.\n", sizeof(WORD));
+   printf("RC5 examples:\n");
+   //for (i = 1; i < 6; i++){
+      //Initialize pt  and key pseudorandomly based on previous ct
+      pt1[0] = ct[0]; pt1[1] = ct[2];
+      //if (i > 1){
+      //   for (j = 0; j < b; j++) key[j] = ct[0]%(768-j);
+      //}
+      // Setup, encrypt, and decrypt
+      // RC5_SETUP(key);
+      RC5_ENCRYPT(pt1, ct);
+      RC5_DECRYPT(ct, pt2);
+      // Print out results, checking for decryption failure
+      printf("\n%d. key = ", i);
+      for (j = 0; j < b; j++) printf("%x", key[j]);
+      printf("\n     plaintext "); printword(pt1[0]); printword(pt1[1]);
+      printf(" ---> ciphertext "); printword(ct[0]); printword(ct[1]);
+      printf("\ndecipheredtext "); printword(pt2[0]); printword(pt2[1]);
+      printf("\n");
+      if (pt1[0]!=pt2[0] || pt1[1]!=pt2[1])
+         printf("Dcryption Error");
+   //}
+    unsigned char testPT[8] = "test";
+    unsigned char testCT[8] = "not?";
+    valread = read(new_socket, testCT, 8);
+    printf("ciphertext: ");
+    for (int i = 0; i < 8; i++){
+       printf("%x", testCT[i]);
+    } printf("\n");
+    RC5_DECRYPT(testCT, testPT);
+    printf("decryptedtext: ");
+    for (int i = 0; i < 8; i++){
+       printf("%c", testPT[i]);
+    } printf("\n");
+
+   /*
+    Status = cryptorun_kex(&CurveIsogeny_SIDHp751);              // Benchmark key exchange system "SIDHp751"
+    if (Status != CRYPTO_SUCCESS) {
+        printf("\n\n   Error detected: %s \n\n", SIDH_get_error_message(Status));
+        return false;
+    }
+    
+    Status = cryptotest_kex_compress(&CurveIsogeny_SIDHp751);    // Test key exchange system "SIDHp751" using compression
+    if (Status != CRYPTO_SUCCESS) {
+        printf("\n\n   Error detected: %s \n\n", SIDH_get_error_message(Status));
+        return false;
+    }
+
+    Status = cryptorun_kex_compress(&CurveIsogeny_SIDHp751);     // Benchmark key exchange system "SIDHp751" using compression
+    if (Status != CRYPTO_SUCCESS) {
+        printf("\n\n   Error detected: %s \n\n", SIDH_get_error_message(Status));
+        return false;
+    }
+    
+    Status = cryptotest_BigMont(&CurveIsogeny_SIDHp751);         // Test elliptic curve "BigMont"
+    if (Status != CRYPTO_SUCCESS) {
+        printf("\n\n   Error detected: %s \n\n", SIDH_get_error_message(Status));
+        return false;
+    }
+    printf("hereee");
+
+
+    Status = cryptorun_BigMont(&CurveIsogeny_SIDHp751);          // Benchmark elliptic curve "BigMont"
+    printf("hereagain");
+    if (Status != CRYPTO_SUCCESS) {
+        printf("\n\n   Error detected: %s \n\n", SIDH_get_error_message(Status));
+        return false;
+    }
+    printf("hereee");*/
+    
+   
+    return true;
+}
